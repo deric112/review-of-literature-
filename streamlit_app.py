@@ -1,7 +1,9 @@
+!pip install streamlit
 import streamlit as st
 import openai
 import requests
 import pandas as pd
+!pip install pymupdf
 import fitz  # PyMuPDF
 import io
 from typing import List
@@ -200,3 +202,4 @@ def streamlit_app():
 
 if __name__ == "__main__":
     streamlit_app()
+
