@@ -1,170 +1,202 @@
-# app.py
-
-import os
-# !pip install streamlit # Removed to avoid re-install
-import requests
-# !pip install PyMuPDF  # Install PyMuPDF for fitz # Removed to avoid re-install
-!pip install pymupdf
-import fitz  # PyMuPDF
-!pip install google-search-results # Install the google-search-results package to provide the serpapi module. # Added to fix error
-from serpapi import GoogleSearch
-from bs4 import BeautifulSoup
+import streamlit as st
 import openai
-import streamlit as st # Import streamlit and alias it as 'st'
+import requests
+import pandas as pd
+import fitz  # PyMuPDF
+import io
+from typing import List
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
 
-# ======= CONFIGURATION ========
-# Set your API Keys as environment variables OR directly here
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY") or "your-serpapi-key"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or "your-openai-key"
+# --- API KEYS (SET YOURS HERE) ---
+OPENAI_API_KEY = "YOUR-OPENAI-API-KEY"
 openai.api_key = OPENAI_API_KEY
 
-SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+# --- Helper Functions ---
 
-# ======= FUNCTIONS ========
+def search_semantic_scholar(topic: str, top_n: int = 5) -> List[dict]:
+    url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={topic}&limit={top_n}&fields=title,authors,year,url,openAccessPdf"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return response.json().get('data', [])
+    else:
+        return []
 
-def search_google_scholar(query, num_results=5):
-    params = {
-        "engine": "google_scholar",
-        "q": query,
-        "api_key": SERPAPI_API_KEY,
-        "num": num_results
-    }
-    search = GoogleSearch(params)
-    results = search.get_dict()
-    
-    papers = []
-    for res in results.get('organic_results', []):
-        papers.append({
-            'title': res.get('title'),
-            'link': res.get('link'),
-            'authors': res.get('publication_info', {}).get('summary', 'Unknown'),
-            'year': res.get('publication_info', {}).get('year', 'Unknown')
-        })
-    return papers
 
-def search_semantic_scholar(query, num_results=5):
-    params = {
-        "query": query,
-        "limit": num_results,
-        "fields": "title,authors,year,url"
-    }
-    response = requests.get(SEMANTIC_SCHOLAR_API, params=params)
-    data = response.json()
-    papers = []
-    for paper in data.get('data', []):
-        papers.append({
-            'title': paper['title'],
-            'link': paper.get('url', 'Unavailable'),
-            'authors': ', '.join([author['name'] for author in paper.get('authors', [])]),
-            'year': paper.get('year', 'Unknown')
-        })
-    return papers
+def download_pdf(pdf_url: str) -> bytes:
+    response = requests.get(pdf_url)
+    if response.status_code == 200:
+        return response.content
+    else:
+        return None
 
-def download_pdf(url, save_path):
-    try:
-        response = requests.get(url, stream=True, timeout=10)
-        if response.headers.get('content-type') == 'application/pdf':
-            with open(save_path, 'wb') as f:
-                f.write(response.content)
-            return True
-    except Exception as e:
-        print(f"Error downloading directly: {e}")
-    return False
 
-def download_from_scihub(doi_or_url, save_path):
-    sci_hub_base = "https://sci-hub.se/"
-    try:
-        session = requests.Session()
-        response = session.get(sci_hub_base + doi_or_url, timeout=15)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        iframe = soup.find('iframe')
-        if iframe:
-            pdf_url = iframe['src']
-            if pdf_url.startswith('//'):
-                pdf_url = 'https:' + pdf_url
-            pdf_response = session.get(pdf_url, stream=True)
-            with open(save_path, 'wb') as f:
-                f.write(pdf_response.content)
-            return True
-    except Exception as e:
-        print(f"Error using Sci-Hub: {e}")
-    return False
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
 
-def extract_text_from_pdf(pdf_path):
-    try:
-        doc = fitz.open(pdf_path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
-        return text
-    except Exception as e:
-        print(f"Error reading PDF: {e}")
-        return ""
 
-def summarize_paper(text, paper_metadata):
+def summarize_text_with_openai(text: str) -> str:
     prompt = f"""
-Please summarize the following paper into a structured table with these fields:
-- Title
-- Authors
-- Publication Year
-- Research Question or Objective
-- Methodology
-- Key Findings
-- Limitations
-- Conclusions
+    Please create a summary table for the following research paper. The table should include:
+    Title, Authors, Publication year, Research question or objective, Methodology, Key findings, Limitations, Conclusions.
+    Provide brief but informative summaries for each, using bullet points where appropriate.
 
-Paper Title: {paper_metadata.get('title')}
-Authors: {paper_metadata.get('authors')}
-Year: {paper_metadata.get('year')}
-
-Paper Text:
-{text[:5000]}  # Limiting input size for token safety.
-
-Please give clear and concise bullet points for each section.
-"""
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        return response['choices'][0]['message']['content']
-    except Exception as e:
-        return f"Error during summarization: {e}"
-
-# ======= STREAMLIT APP ========
+    Text:
+    {text[:6000]}
+    """
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
+    return response.choices[0].message.content
 
 
-st.title("📚 Research Summarizer (Google + Semantic + Sci-Hub Backup)")
+def ask_question(text: str, question: str) -> str:
+    prompt = f"""
+    Based on the following research paper content, answer the question:
 
-query = st.text_input("What are the behavioural and psychological factors that explain why urban middle-class consumers in India increasingly use credit cards?")
+    Paper Content:
+    {text[:6000]}
 
-if query:  # <--- This triggers automatically once the user types
-    with st.spinner("Searching papers..."):
-        google_papers = search_google_scholar(query)
-        semantic_papers = search_semantic_scholar(query)
-        papers = google_papers + semantic_papers
+    Question:
+    {question}
+    """
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    )
+    return response.choices[0].message.content
 
-    for idx, paper in enumerate(papers):
-        st.subheader(f"Paper {idx+1}: {paper['title']}")
-        filename = f"temp_{idx}.pdf"
-        got_pdf = False
 
-        if paper['link'] and download_pdf(paper['link'], filename):
-            got_pdf = True
-        else:
-            doi = paper['link'].split('doi.org/')[-1] if 'doi.org' in paper['link'] else paper['link']
-            if download_from_scihub(doi, filename):
-                got_pdf = True
+def auto_cluster_texts(texts: List[str], n_clusters: int = 3) -> List[int]:
+    vectorizer = TfidfVectorizer(stop_words='english')
+    X = vectorizer.fit_transform(texts)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    labels = kmeans.fit_predict(X)
+    return labels
 
-        if got_pdf:
-            text = extract_text_from_pdf(filename)
-            if text:
-                with st.spinner("Summarizing..."):
-                    summary = summarize_paper(text, paper)
-                st.markdown(summary)
-            else:
-                st.warning("Failed to extract text from PDF.")
-            os.remove(filename)  # Clean up temp file
-        else:
-            st.warning("Could not fetch full text. Only metadata available.")
+
+def specialized_analysis(texts: List[str], task: str) -> str:
+    joined_text = "\n".join(texts)
+    prompt = f"""
+    Analyze the following group of research papers and {task}. Provide detailed but concise points.
+
+    Texts:
+    {joined_text[:6000]}
+    """
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    )
+    return response.choices[0].message.content
+
+# --- Streamlit App ---
+
+def streamlit_app():
+    st.title("📚 AI Research Assistant")
+
+    st.sidebar.header("Configuration")
+    mode = st.sidebar.selectbox("Select Mode", ["Search Papers by Topic", "Upload Your Own Papers"])
+    num_papers = st.sidebar.slider("Number of papers (if searching)", min_value=1, max_value=20, value=5)
+    n_clusters = st.sidebar.slider("Number of Clusters", min_value=2, max_value=10, value=3)
+
+    summaries = []
+    full_texts = []
+    titles = []
+    qa_memory = []
+
+    if mode == "Search Papers by Topic":
+        topic = st.text_input("Enter Research Topic:")
+        if st.button("Search and Summarize"):
+            with st.spinner("Searching papers..."):
+                papers = search_semantic_scholar(topic, top_n=num_papers)
+                for paper in papers:
+                    title = paper.get("title", "Unknown Title")
+                    pdf_link = paper.get("openAccessPdf", {}).get("url")
+                    if pdf_link:
+                        file_bytes = download_pdf(pdf_link)
+                        if file_bytes:
+                            text = extract_text_from_pdf(file_bytes)
+                            summary = summarize_text_with_openai(text)
+                            summaries.append(summary)
+                            full_texts.append(text)
+                            titles.append(title)
+
+    elif mode == "Upload Your Own Papers":
+        uploaded_files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
+        if uploaded_files:
+            if st.button("Summarize Uploaded Papers"):
+                with st.spinner("Summarizing uploaded papers..."):
+                    for uploaded_file in uploaded_files:
+                        file_bytes = uploaded_file.read()
+                        text = extract_text_from_pdf(file_bytes)
+                        summary = summarize_text_with_openai(text)
+                        summaries.append(summary)
+                        full_texts.append(text)
+                        titles.append(uploaded_file.name)
+
+    if summaries:
+        st.header("📒 Paper Summaries")
+        df = pd.DataFrame({"Title": titles, "Summary": summaries})
+        st.dataframe(df)
+
+        clusters = auto_cluster_texts(full_texts, n_clusters=n_clusters)
+        cluster_map = {i: [] for i in range(n_clusters)}
+        for idx, label in enumerate(clusters):
+            cluster_map[label].append(titles[idx])
+
+        st.subheader("🔍 Auto-Generated Clusters")
+        for cluster_id, papers in cluster_map.items():
+            st.markdown(f"**Cluster {cluster_id+1}:** {', '.join(papers)}")
+
+        selected_titles = st.multiselect("Select Papers for Question Answering or Group Analysis", titles)
+
+        if selected_titles:
+            selected_texts = [full_texts[titles.index(t)] for t in selected_titles]
+            cluster_text = "\n".join(selected_texts)
+
+            user_question = st.text_input("Ask a custom question about the selected paper(s):")
+            if st.button("Get Custom Answer") and user_question:
+                answer = ask_question(cluster_text, user_question)
+                st.success(answer)
+                qa_memory.append({"Question": user_question, "Answer": answer, "Papers": selected_titles})
+
+            if st.button("Find Research Gaps"):
+                answer = specialized_analysis(selected_texts, "identify the research gaps")
+                st.success(answer)
+                qa_memory.append({"Question": "Research Gaps", "Answer": answer, "Papers": selected_titles})
+
+            if st.button("Suggest Future Work"):
+                answer = specialized_analysis(selected_texts, "suggest future research directions")
+                st.success(answer)
+                qa_memory.append({"Question": "Future Work", "Answer": answer, "Papers": selected_titles})
+
+            if st.button("Find Contradictions"):
+                answer = specialized_analysis(selected_texts, "detect contradictions among the papers")
+                st.success(answer)
+                qa_memory.append({"Question": "Contradictions", "Answer": answer, "Papers": selected_titles})
+
+        if qa_memory:
+            st.subheader("💬 Q&A Session History")
+            for entry in qa_memory:
+                st.markdown(f"**Question:** {entry['Question']}")
+                st.markdown(f"**Answer:** {entry['Answer']}")
+                st.markdown(f"**Papers:** {', '.join(entry['Papers'])}")
+                st.markdown("---")
+
+            qa_df = pd.DataFrame(qa_memory)
+            qa_csv = qa_df.to_csv(index=False).encode('utf-8')
+            st.download_button("Download Q&A History", data=qa_csv, file_name="qa_history.csv", mime='text/csv')
+
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Summaries as CSV", data=csv, file_name="summaries.csv", mime='text/csv')
+
+if __name__ == "__main__":
+    streamlit_app()
